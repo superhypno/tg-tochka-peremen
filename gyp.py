@@ -10,7 +10,8 @@ from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -22,9 +23,14 @@ from database import Database
 from questions import QUESTIONS, RESULTS, RESULT_ORDER
 
 
+def _parse_chat_id(raw: str) -> int | str:
+    return int(raw) if raw.lstrip("-").isdigit() else raw
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
+    channel_id: int | str
     channel_url: str
     diagnostic_url: str
     database_path: str
@@ -33,16 +39,17 @@ class Config:
 
 def load_config() -> Config:
     load_dotenv()
-    required = ("BOT_TOKEN", "CHANNEL_URL", "DIAGNOSTIC_URL")
+    required = ("BOT_TOKEN", "CHANNEL_ID", "CHANNEL_URL", "DIAGNOSTIC_URL")
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         raise RuntimeError(f"В .env не заполнены: {', '.join(missing)}")
     raw_admin_group_id = os.getenv("ADMIN_GROUP_ID", "").strip()
     admin_group_id: int | str | None = None
     if raw_admin_group_id:
-        admin_group_id = int(raw_admin_group_id) if raw_admin_group_id.lstrip("-").isdigit() else raw_admin_group_id
+        admin_group_id = _parse_chat_id(raw_admin_group_id)
     return Config(
         bot_token=os.environ["BOT_TOKEN"],
+        channel_id=_parse_chat_id(os.environ["CHANNEL_ID"].strip()),
         channel_url=os.environ["CHANNEL_URL"],
         diagnostic_url=os.environ["DIAGNOSTIC_URL"],
         database_path=os.getenv("DATABASE_PATH", "bot.sqlite3"),
@@ -59,8 +66,42 @@ class TestState(StatesGroup):
     answering = State()
 
 
+WELCOME_TEXT = (
+    "<b>Тест «Что на самом деле вас тормозит?»</b>\n\n"
+    "7 коротких вопросов, около 3 минут. В конце вы увидите ведущий паттерн, "
+    "который может мешать двигаться вперёд, и направление для самостоятельного исследования.\n\n"
+    "Это не медицинская или психологическая диагностика."
+)
+
+SUBSCRIBE_PROMPT_TEXT = "Чтобы пройти тест, подпишитесь на канал и нажмите «Я подписался»."
+
+SUBSCRIBED_STATUSES = {
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.CREATOR,
+}
+
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(config.channel_id, user_id)
+    except TelegramAPIError:
+        logging.exception("Не удалось проверить подписку на канал")
+        return False
+    return member.status in SUBSCRIBED_STATUSES
+
+
 def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пройти тест →", callback_data="start_test")]])
+
+
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Подписаться на канал", url=config.channel_url)],
+            [InlineKeyboardButton(text="Я подписался", callback_data="check_subscription")],
+        ]
+    )
 
 
 def question_keyboard(index: int) -> InlineKeyboardMarkup:
@@ -148,17 +189,29 @@ async def start(message: Message, state: FSMContext, command: CommandObject) -> 
     db.log_event(message.from_user.id, "start", {"source": source})
     await state.clear()
     await state.update_data(source=source)
-    await message.answer(
-        "<b>Тест «Что на самом деле вас тормозит?»</b>\n\n"
-        "7 коротких вопросов, около 3 минут. В конце вы увидите ведущий паттерн, "
-        "который может мешать двигаться вперёд, и направление для самостоятельного исследования.\n\n"
-        "Это не медицинская или психологическая диагностика.",
-        reply_markup=welcome_keyboard(),
-    )
+
+    if not await is_subscribed(message.bot, message.from_user.id):
+        await message.answer(SUBSCRIBE_PROMPT_TEXT, reply_markup=subscribe_keyboard())
+        return
+
+    await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
+
+
+@router.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery) -> None:
+    if not await is_subscribed(callback.bot, callback.from_user.id):
+        await callback.answer("Вы ещё не подписались на канал.", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(WELCOME_TEXT, reply_markup=welcome_keyboard())
 
 
 @router.callback_query(F.data == "start_test")
 async def start_test(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_subscribed(callback.bot, callback.from_user.id):
+        await callback.answer("Вы ещё не подписались на канал.", show_alert=True)
+        await callback.message.edit_text(SUBSCRIBE_PROMPT_TEXT, reply_markup=subscribe_keyboard())
+        return
     await begin_test(callback, state)
 
 
