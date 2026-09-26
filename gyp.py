@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -23,7 +23,7 @@ from database import Database
 from questions import QUESTIONS, RESULTS, RESULT_ORDER
 
 
-def _parse_chat_id(raw: str) -> int | str:
+def parse_chat_id(raw: str) -> int | str:
     return int(raw) if raw.lstrip("-").isdigit() else raw
 
 
@@ -46,10 +46,10 @@ def load_config() -> Config:
     raw_admin_group_id = os.getenv("ADMIN_GROUP_ID", "").strip()
     admin_group_id: int | str | None = None
     if raw_admin_group_id:
-        admin_group_id = _parse_chat_id(raw_admin_group_id)
+        admin_group_id = parse_chat_id(raw_admin_group_id)
     return Config(
         bot_token=os.environ["BOT_TOKEN"],
-        channel_id=_parse_chat_id(os.environ["CHANNEL_ID"].strip()),
+        channel_id=parse_chat_id(os.environ["CHANNEL_ID"].strip()),
         channel_url=os.environ["CHANNEL_URL"],
         diagnostic_url=os.environ["DIAGNOSTIC_URL"],
         database_path=os.getenv("DATABASE_PATH", "bot.sqlite3"),
@@ -64,22 +64,13 @@ router = Router()
 
 class TestState(StatesGroup):
     answering = State()
+    waiting_for_result = State()
 
 
-WELCOME_TEXT = (
-    "<b>Тест «Что на самом деле вас тормозит?»</b>\n\n"
-    "7 коротких вопросов, около 3 минут. В конце вы увидите ведущий паттерн, "
-    "который может мешать двигаться вперёд, и направление для самостоятельного исследования.\n\n"
-    "Это не медицинская или психологическая диагностика."
+RESULT_SUBSCRIPTION_TEXT = (
+    "<b>Тест пройден.</b>\n\n"
+    "Чтобы получить результат, подпишитесь на канал и нажмите «Я подписался»."
 )
-
-SUBSCRIBE_PROMPT_TEXT = "Чтобы пройти тест, подпишитесь на канал и нажмите «Я подписался»."
-
-SUBSCRIBED_STATUSES = {
-    ChatMemberStatus.MEMBER,
-    ChatMemberStatus.ADMINISTRATOR,
-    ChatMemberStatus.CREATOR,
-}
 
 
 async def is_subscribed(bot: Bot, user_id: int) -> bool:
@@ -88,18 +79,21 @@ async def is_subscribed(bot: Bot, user_id: int) -> bool:
     except TelegramAPIError:
         logging.exception("Не удалось проверить подписку на канал")
         return False
-    return member.status in SUBSCRIBED_STATUSES
+    status = getattr(member.status, "value", member.status)
+    return status in {"creator", "owner", "administrator", "member"} or (
+        status == "restricted" and bool(getattr(member, "is_member", False))
+    )
 
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пройти тест →", callback_data="start_test")]])
 
 
-def subscribe_keyboard() -> InlineKeyboardMarkup:
+def result_subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Подписаться на канал", url=config.channel_url)],
-            [InlineKeyboardButton(text="Я подписался", callback_data="check_subscription")],
+            [InlineKeyboardButton(text="Я подписался", callback_data="check_result_subscription")],
         ]
     )
 
@@ -129,9 +123,7 @@ def question_text(index: int) -> str:
 def result_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Записаться на бесплатную диагностику", url=config.diagnostic_url)],
-            [InlineKeyboardButton(text="Подписаться на канал", url=config.channel_url)],
-            [InlineKeyboardButton(text="Пройти тест ещё раз", callback_data="retake")],
+            [InlineKeyboardButton(text="Записаться на диагностику", url=config.diagnostic_url)],
         ]
     )
 
@@ -182,6 +174,33 @@ async def send_result_to_admin_group(user, source: str | None, result_type: str,
         logging.exception("Не удалось отправить результат в группу")
 
 
+async def show_result(callback: CallbackQuery, state: FSMContext) -> None:
+    """Показывает итог только после подтверждённой подписки на канал."""
+    data = await state.get_data()
+    result_type = data["result_type"]
+    selected = data["selected_types"]
+    session_id = data["session_id"]
+    scores = data["scores"]
+    db.finish_session(session_id, result_type)
+    db.log_event(callback.from_user.id, "test_completed", {"session_id": session_id, "result_type": result_type, "scores": scores})
+    await send_result_to_admin_group(callback.from_user, data.get("source"), result_type, selected, callback.bot)
+    await state.clear()
+
+    result = RESULTS[result_type]
+    await callback.message.edit_text(
+        f"<b>Один из возможных сценариев: {result['title']}</b>\n\n"
+        f"{result['body']}\n\n"
+        "<b>Важно:</b> тест не ставит диагноз и не определяет истинную причину проблемы. "
+        "Он может помочь заметить определённый паттерн и сформулировать, что стоит обсудить глубже.\n\n"
+        "Тест показал один из возможных сценариев, который может быть связан с вашей ситуацией. "
+        "Но он не может показать, почему именно этот сценарий появился и что поддерживает его именно у вас.\n\n"
+        "Это можно разобрать на бесплатной диагностике. На ней мы рассмотрим одну конкретную ситуацию, "
+        "которая сейчас повторяется в вашей жизни, и определим, что может стоять за ней.\n\n"
+        "<b>Если хотите разобраться — записывайтесь на диагностику.</b>",
+        reply_markup=result_keyboard(),
+    )
+
+
 @router.message(Command("start"))
 async def start(message: Message, state: FSMContext, command: CommandObject) -> None:
     source = (command.args or "direct").strip()[:64]
@@ -189,30 +208,27 @@ async def start(message: Message, state: FSMContext, command: CommandObject) -> 
     db.log_event(message.from_user.id, "start", {"source": source})
     await state.clear()
     await state.update_data(source=source)
-
-    if not await is_subscribed(message.bot, message.from_user.id):
-        await message.answer(SUBSCRIBE_PROMPT_TEXT, reply_markup=subscribe_keyboard())
-        return
-
-    await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
-
-
-@router.callback_query(F.data == "check_subscription")
-async def check_subscription(callback: CallbackQuery) -> None:
-    if not await is_subscribed(callback.bot, callback.from_user.id):
-        await callback.answer("Вы ещё не подписались на канал.", show_alert=True)
-        return
-    await callback.answer()
-    await callback.message.edit_text(WELCOME_TEXT, reply_markup=welcome_keyboard())
+    await message.answer(
+        "<b>Тест «Что на самом деле вас тормозит?»</b>\n\n"
+        "7 коротких вопросов, около 3 минут. В конце вы увидите ведущий паттерн, "
+        "который может мешать двигаться вперёд, и направление для самостоятельного исследования.\n\n"
+        "Это не медицинская или психологическая диагностика.",
+        reply_markup=welcome_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "start_test")
 async def start_test(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await is_subscribed(callback.bot, callback.from_user.id):
-        await callback.answer("Вы ещё не подписались на канал.", show_alert=True)
-        await callback.message.edit_text(SUBSCRIBE_PROMPT_TEXT, reply_markup=subscribe_keyboard())
-        return
     await begin_test(callback, state)
+
+
+@router.callback_query(F.data == "check_result_subscription", TestState.waiting_for_result)
+async def check_result_subscription(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_subscribed(callback.bot, callback.from_user.id):
+        await callback.answer("Подписка пока не обнаружена. Подпишитесь и нажмите кнопку ещё раз.", show_alert=True)
+        return
+    await callback.answer()
+    await show_result(callback, state)
 
 
 @router.callback_query(F.data.startswith("answer:"), TestState.answering)
@@ -255,22 +271,11 @@ async def answer_question(callback: CallbackQuery, state: FSMContext) -> None:
     for result_type in selected:
         scores[result_type] += 1
     result_type = max(RESULT_ORDER, key=lambda item: scores[item])
-    db.finish_session(session_id, result_type)
-    db.log_event(callback.from_user.id, "test_completed", {"session_id": session_id, "result_type": result_type, "scores": scores})
-    await send_result_to_admin_group(
-        callback.from_user,
-        data.get("source"),
-        result_type,
-        selected,
-        callback.bot,
-    )
-    await state.clear()
-    result = RESULTS[result_type]
+    await state.set_state(TestState.waiting_for_result)
+    await state.update_data(result_type=result_type, selected_types=selected, scores=scores)
     await callback.message.edit_text(
-        f"<b>Ваш основной паттерн: {result['title']}</b>\n\n{result['body']}\n\n"
-        "Если хотите разобраться в своей ситуации бережно и предметно, запишитесь на бесплатную диагностику. "
-        "А в канале — больше материалов и практик для саморефлексии.",
-        reply_markup=result_keyboard(),
+        RESULT_SUBSCRIPTION_TEXT,
+        reply_markup=result_subscription_keyboard(),
     )
 
 
